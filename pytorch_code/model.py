@@ -124,104 +124,6 @@ class LinearSelfAttention(Module):
 
         return hidden_states
 
-class FeedForward(nn.Module):
-    """
-    Point-wise feed-forward layer is implemented by two dense layers.
-
-    Args:
-        input_tensor (torch.Tensor): the input of the point-wise feed-forward layer
-
-    Returns:
-        hidden_states (torch.Tensor): the output of the point-wise feed-forward layer
-
-    """
-
-    def __init__(
-        self, hidden_size, inner_size, hidden_dropout_prob, hidden_act, layer_norm_eps
-    ):
-        super(FeedForward, self).__init__()
-        self.dense_1 = nn.Linear(hidden_size, inner_size)
-        self.intermediate_act_fn = self.get_hidden_act(hidden_act)
-
-        self.dense_2 = nn.Linear(inner_size, hidden_size)
-        self.LayerNorm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.dropout = nn.Dropout(hidden_dropout_prob)
-
-    def get_hidden_act(self, act):
-        ACT2FN = {
-            "gelu": self.gelu,
-            "relu": torch.nn.functional.relu,
-            "swish": self.swish,
-            "tanh": torch.tanh,
-            "sigmoid": torch.sigmoid,
-        }
-        return ACT2FN[act]
-
-    def gelu(self, x):
-        """Implementation of the gelu activation function.
-
-        For information: OpenAI GPT's gelu is slightly different (and gives slightly different results)::
-
-            0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
-
-        Also see https://arxiv.org/abs/1606.08415
-        """
-        return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
-
-    def swish(self, x):
-        return x * torch.sigmoid(x)
-
-    def forward(self, input_tensor):
-        hidden_states = self.dense_1(input_tensor)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-
-        hidden_states = self.dense_2(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-
-        return hidden_states
-
-class TransformerLayer(nn.Module):
-    """
-    One transformer layer consists of a multi-head self-attention layer and a point-wise feed-forward layer.
-
-    Args:
-        hidden_states (torch.Tensor): the input of the multi-head self-attention sublayer
-        attention_mask (torch.Tensor): the attention mask for the multi-head self-attention sublayer
-
-    Returns:
-        feedforward_output (torch.Tensor): The output of the point-wise feed-forward sublayer,
-                                           is the output of the transformer layer.
-
-    """
-
-    def __init__(
-        self,
-        n_heads,
-        hidden_size,
-        intermediate_size,
-        hidden_dropout_prob,
-        attn_dropout_prob,
-        hidden_act,
-        layer_norm_eps,
-    ):
-        super(TransformerLayer, self).__init__()
-        self.multi_head_attention = LinearSelfAttention(
-            n_heads, hidden_size, hidden_dropout_prob, attn_dropout_prob, layer_norm_eps
-        )
-        self.feed_forward = FeedForward(
-            hidden_size,
-            intermediate_size,
-            hidden_dropout_prob,
-            hidden_act,
-            layer_norm_eps,
-        )
-
-    def forward(self, hidden_states):
-        attention_output = self.multi_head_attention(hidden_states, None)
-        feedforward_output = self.feed_forward(attention_output)
-        return feedforward_output
-
 class SessionGraph(Module):
     def __init__(self, opt, n_node):
         super(SessionGraph, self).__init__()
@@ -246,11 +148,6 @@ class SessionGraph(Module):
         self.memory_bank = None
         self.fusion_factor = 0.8
 
-        transformer_encoder = []
-        for i in range(opt.n_layers):
-            transformer_encoder.append(('trans{}'.format(i+1), TransformerLayer(n_heads=4, hidden_size=self.hidden_size, intermediate_size=self.hidden_size, hidden_dropout_prob=0.2, attn_dropout_prob=0.2, hidden_act='gelu', layer_norm_eps=1e-12)))
-        self.transformer_encoder = nn.Sequential(collections.OrderedDict(transformer_encoder))
-
     def save(self, epoch):
         torch.save(self.state_dict(), './output/epoch_'+str(epoch)+'.pth')                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
 
@@ -264,24 +161,28 @@ class SessionGraph(Module):
         # hidden = self.pos_emb(hidden)
         hidden = hidden + self.pos_emb(lens)
         ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
-        # ht = ht.view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
-        Ek = self.transformer_encoder(hidden)
-        En = Ek[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]
+        q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
+        q2 = self.linear_two(hidden)  # batch_size x seq_length x latent_size
+        alpha = F.softmax(self.linear_three(torch.sigmoid(q1 + q2)) + (1-mask).unsqueeze(-1)*(-9999), dim=1)
+        a = torch.sum(alpha * hidden * mask.view(mask.shape[0], -1, 1).float(), 1)
 
         if not self.nonhybrid:
-            a = F.normalize(self.fusion_factor*En + self.fusion_factor*ht)
+            a = F.normalize(self.linear_transform(torch.cat([a, ht], 1)), dim=-1)
         b = F.normalize(self.embedding.weight[1:], dim=-1)  # n_nodes x latent_size
+
         scores = torch.matmul(a, b.transpose(1, 0)) * 16
-        return scores, a
+        return scores
 
     def forward(self, inputs, A):
         hidden = self.embedding(inputs)
         hidden = self.dropout(F.normalize(hidden, dim=-1))
         hidden = self.dropout(self.gnn(A, hidden))
+        # A: (batch_size, user, 2*user)
         return hidden
 
 
 def trans_to_cuda(variable):
+    return variable.to(torch.device('mps'))
     if torch.cuda.is_available():
         return variable.to(torch.device('cuda:0'))
     else:
@@ -296,17 +197,32 @@ def trans_to_cpu(variable):
 
 
 def forward(model, i, data):
-    alias_inputs, A, items, mask, pos, targets = data.get_slice(i)
+    alias_inputs, corrupted_alias_inputs, A, A_corrupted, items, mask, pos, targets, new_length = data.get_slice(i)
     alias_inputs = trans_to_cuda(torch.Tensor(alias_inputs).long())
+    corrupted_alias_inputs = trans_to_cuda(torch.Tensor(corrupted_alias_inputs).long())
     items = trans_to_cuda(torch.Tensor(items).long())
+    new_length = trans_to_cuda(torch.LongTensor(new_length))
     A = trans_to_cuda(torch.Tensor(np.array(A)).float())
+    A_corrupted = trans_to_cuda(torch.Tensor(np.array(A_corrupted)).float())
     mask = trans_to_cuda(torch.Tensor(mask).long())
     pos = trans_to_cuda(torch.Tensor(pos).long())
     hidden = model(items, A)
+
+    hidden_corrupted = model(items, A_corrupted)
+    
     get = lambda i: hidden[i][alias_inputs[i]]
     seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
-    scores, global_session = model.compute_scores(seq_hidden, mask)
-    return targets, scores, global_session
+
+    get_corrupted = lambda i: hidden_corrupted[i][corrupted_alias_inputs[i]]
+    corrupted_seq_hidden = torch.stack([get_corrupted(i) for i in torch.arange(len(alias_inputs)).long()])
+
+    corrupted_mask = trans_to_cuda(torch.linspace(0, corrupted_seq_hidden.shape[1]-1, corrupted_seq_hidden.shape[1]).view(1, corrupted_seq_hidden.shape[1]).repeat(corrupted_seq_hidden.shape[0], 1)) < new_length.view(corrupted_seq_hidden.shape[0], 1)
+
+    graph_hidden = (seq_hidden*mask.T).sum(dim=1)
+    corrupted_graph_hidden = (corrupted_seq_hidden*corrupted_mask.T).sum(dim=1)
+
+    scores = model.compute_scores(seq_hidden, mask)
+    return targets, scores, graph_hidden, corrupted_graph_hidden
 
 def fill_memory_bank(model, train_data):
     model.train()
@@ -330,32 +246,30 @@ def train_test(model, train_data, test_data, epoch):
     # contrast_loss_ratio = np.tanh((epoch)/12)
     for i, j in zip(slices, np.arange(len(slices))):
         model.optimizer.zero_grad()
-        targets_1, scores_1, global_session_1 = forward(model, i, train_data)
+        targets_1, scores_1, graph_hidden, corrupted_graph_hidden = forward(model, i, train_data)
         targets_1 = trans_to_cuda(torch.Tensor(targets_1).long())
         loss = model.loss_function(scores_1, targets_1 - 1)
-        targets_2, scores_2, global_session_2 = forward(model, i, train_data)
-        model.memory_bank[i, 0, :] = global_session_1.detach().cpu().numpy()
-        model.memory_bank[i, 1, :] = global_session_2.detach().cpu().numpy()
+        model.memory_bank[i, 0, :] = graph_hidden.detach().cpu().numpy()
+        model.memory_bank[i, 1, :] = corrupted_graph_hidden.detach().cpu().numpy()
         loss_contrast = torch.Tensor([0])
         loss_KL = torch.Tensor([0])
         if epoch >= 0:
             neg = train_data.neg_inputs[i]
             neg_global_vector = model.memory_bank[neg]
             neg_global_vector = neg_global_vector.reshape(neg_global_vector.shape[0], -1, neg_global_vector.shape[-1])
-            query = global_session_1.unsqueeze(1)
-            key = global_session_2.unsqueeze(1)
+            query = graph_hidden.unsqueeze(1)
+            key = corrupted_graph_hidden.unsqueeze(1)
             samples = torch.hstack([key, trans_to_cuda(torch.FloatTensor(neg_global_vector))])
             logits = F.cosine_similarity(query, samples)
             labels = trans_to_cuda(torch.zeros(samples.shape[0]).long())
             loss_contrast = F.cross_entropy(logits*12, labels)
-            # loss_KL = 1/2 * F.kl_div(F.log_softmax(scores_1, dim=-1), F.softmax(scores_2, dim=-1), reduce='sum') + 1/2 * F.kl_div(F.log_softmax(scores_2, dim=-1), F.softmax(scores_1, dim=-1), reduce='sum')
             loss += contrast_loss_ratio * loss_contrast
         loss.backward()
         model.optimizer.step()
         total_loss += loss
         total_contrast_loss += np.tanh((epoch+1)/6) * loss_contrast
         if j % int(len(slices) / 5 + 1) == 0:
-            print('[%d/%d] Classification Loss: %.4f, Contrast Loss: %.4f, R-Drop Loss: %.4f' % (j, len(slices), (loss.cpu()-(loss_contrast*contrast_loss_ratio).cpu()).item(), loss_contrast.item(), loss_KL.item()))
+            print('[%d/%d] Classification Loss: %.4f, Contrast Loss: %.4f'% (j, len(slices), (loss.cpu()-(loss_contrast*contrast_loss_ratio).cpu()).item(), loss_contrast.item()))
     print('\tTotal Classification Loss:\t%.3f, Total Contrast Loss:\t%.3f, Contrast Loss Weight:\t%.3f' % (total_loss, total_contrast_loss, contrast_loss_ratio))
 
     print('start predicting: ', datetime.datetime.now())

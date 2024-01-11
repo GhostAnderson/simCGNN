@@ -36,10 +36,11 @@ def split_validation(train_set, valid_portion):
 
 
 class Data():
-    def __init__(self, data, shuffle=False, num_neg=2):
+    def __init__(self, data, shuffle=False, items = 0, num_neg=2):
         inputs = data[0]
         inputs, mask, pos, len_max = data_masks(inputs, [0])
         self.inputs = np.asarray(inputs)
+        self.items = items
         self.mask = np.asarray(mask)
         self.pos = np.asarray(pos)
         self.len_max = len_max
@@ -47,7 +48,7 @@ class Data():
         self.length = len(inputs)
         self.shuffle = shuffle
         self.batch_size = 100
-        self.num_neg = 2
+        self.num_neg = 1
         self._generate_neg_x()
     
     def _generate_neg_x(self):
@@ -110,4 +111,34 @@ class Data():
             u_A = np.concatenate([u_A_in, u_A_out]).transpose()
             A.append(u_A)
             alias_inputs.append([np.where(node == i)[0][0] for i in u_input])
-        return alias_inputs, A, items, mask, pos, targets
+
+        corrupted_alias_inputs = []
+        A_last_removed = []
+        new_length = []
+        for u_input in inputs:
+            u_length = (u_input!=0).sum()
+            if u_length != 1:
+                u_input[u_length-1] = 0
+                new_length.append(u_length)
+            else:
+                new_length.append(2)
+                u_input[1] = np.random.randint(1, self.items)
+            node = np.unique(u_input)
+            u_A = np.zeros((max_n_node, max_n_node))
+            for i in np.arange(len(u_input) - 1):
+                if u_input[i + 1] == 0:
+                    break
+                u = np.where(node == u_input[i])[0][0]
+                v = np.where(node == u_input[i + 1])[0][0]
+                u_A[u][v] = 1
+            u_sum_in = np.sum(u_A, 0)
+            u_sum_in[np.where(u_sum_in == 0)] = 1
+            u_A_in = np.divide(u_A, u_sum_in)
+            u_sum_out = np.sum(u_A, 1)
+            u_sum_out[np.where(u_sum_out == 0)] = 1
+            u_A_out = np.divide(u_A.transpose(), u_sum_out)
+            u_A = np.concatenate([u_A_in, u_A_out]).transpose()
+            A_last_removed.append(u_A)
+            corrupted_alias_inputs.append([np.where(node == i)[0][0] for i in u_input])
+            
+        return alias_inputs, corrupted_alias_inputs, A, A_last_removed, items, mask, pos, targets, new_length

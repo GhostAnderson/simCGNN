@@ -44,24 +44,23 @@ torch.backends.cudnn.benchmark = True
 
 
 def main():
-    train_data = pickle.load(open('../datasets/' + opt.dataset + '/train.txt', 'rb'))
+    train_data = pickle.load(open('./datasets/' + opt.dataset + '/train.txt', 'rb'))
     if opt.validation:
         train_data, valid_data = split_validation(train_data, opt.valid_portion)
         test_data = valid_data
     else:
-        test_data = pickle.load(open('../datasets/' + opt.dataset + '/test.txt', 'rb'))
-    # all_train_seq = pickle.load(open('../datasets/' + opt.dataset + '/all_train_seq.txt', 'rb'))
-    # g = build_graph(all_train_seq)
-    train_data = Data(train_data, shuffle=True)
-    test_data = Data(test_data, shuffle=False)
-    opt.len_max = max(train_data.len_max, test_data.len_max)
-    # del all_train_seq, g
+        test_data = pickle.load(open('./datasets/' + opt.dataset + '/test.txt', 'rb'))
+        
     if opt.dataset == 'diginetica':
         n_node = 43098
     elif opt.dataset == 'yoochoose1_64' or opt.dataset == 'yoochoose1_4':
         n_node = 37484
     else:
         n_node = 310
+
+    train_data = Data(train_data, shuffle=True, items=n_node)
+    test_data = Data(test_data, shuffle=False, items=n_node)
+    opt.len_max = max(train_data.len_max, test_data.len_max)
 
     model = trans_to_cuda(SessionGraph(opt, n_node))
     model.memory_bank = np.random.random([train_data.length, 2, opt.hiddenSize])
